@@ -129,46 +129,44 @@ if btn_crawl:
         # Chỉ lấy FireAnt token một lần
         status_text.text("Đang khởi tạo FireAnt API...")
         client = FireAntClient(headless=is_headless, user_data_dir=user_data_dir if user_data_dir else None)
+        
+        # Pre-fetch token once so threads don't race to open browsers
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        loop.run_until_complete(client._get_token())
+        
         ppe_client = CafeFPPEClient()
     
-    for i, ticker in enumerate(tickers):
-        status_text.text(f"Đang xử lý {ticker} ({i+1}/{len(tickers)})...")
+    import concurrent.futures
+    
+    def process_ticker(ticker):
         source_name = "N/A"
         raw_data = {"status": "MISSING_OR_NO_PERMISSION"}
+        ppe_res = {"status": "MISSING", "data": {}}
         
         if "Tự động" in data_source:
-            # Crawl FireAnt API cho các chỉ tiêu chính
             raw_data = client.scrape_symbol_financials(ticker, start_year, end_year)
             source_name = "FireAnt API"
             
-            ppe_res = {"status": "MISSING", "data": {}}
             if raw_data.get("status") == "OK":
-                # Crawl CafeF PPE riêng
-                st.write(f"Đang gọi CafeF lấy riêng PPE cho {ticker}...")
                 ppe_res = ppe_client.get_ppe(ticker, end_year)
-                
-                if ppe_res["status"] == "OK":
-                    pass
         else:
             ticker_htmls = []
             for f in uploaded_htmls:
                 if len(tickers) == 1 or ticker.lower() in f.name.lower():
                     ticker_htmls.append(f.getvalue().decode('utf-8'))
                     
-            if not ticker_htmls:
-                st.warning(f"Không tìm thấy file HTML nào được tải lên cho mã {ticker}.")
-            else:
+            if ticker_htmls:
                 from html_parser import build_raw_data_from_htmls
                 raw_data = build_raw_data_from_htmls(ticker_htmls, ticker, "FireAnt")
                 source_name = "Thủ công"
-        
-        if raw_data.get("status") == "MISSING_OR_NO_PERMISSION":
-            st.warning(f"Mã {ticker} không lấy được dữ liệu tài chính.")
-            
+                
         mapper = FireantMapper(raw_data)
         unified_dict = build_unified_data(mapper, ticker, start_year, end_year, unit_multiplier=1.0 / 1000000.0)
         
-        # Override PPE from CafeF (Luôn ưu tiên CafeF, nếu hỏng thì ghi MISSING chứ ko dùng FireAnt)
         if "Tự động" in data_source:
             if ppe_res["status"] == "OK":
                 for y, val in ppe_res["data"].items():
@@ -178,26 +176,43 @@ if btn_crawl:
                 for y in unified_dict["years"]:
                     unified_dict["years"][y]["ppe_gross"] = {"value": None, "source": "MISSING_FROM_CAFEF"}
                     
-        unified_data_list.append(unified_dict)
+        return ticker, raw_data, unified_dict
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(process_ticker, t): t for t in tickers}
+        completed_count = 0
         
-        # Build logs
-        for year in range(start_year, end_year + 1):
-            yd = unified_dict["years"].get(year, {})
-            # Log DATA sheet
-            for k, f in [("Tổng tài sản đầu kỳ", "total_assets_prev"), ("Tổng tài sản năm t", "total_assets"), ("Nợ phải trả năm t", "liabilities"), ("Các khoản phải thu ngắn hạn", "short_term_receivables"), ("Hàng tồn kho", "inventory"), ("Doanh thu thuần", "revenue"), ("Lợi nhuận sau thuế", "net_profit_after_tax"), ("Dòng tiền từ hoạt động kinh doanh", "operating_cash_flow")]:
-                val_key = "total_assets" if f == "total_assets_prev" else f
-                src_dict = unified_dict["years"].get(year - 1, {}) if "_prev" in f else yd
-                info = src_dict.get(val_key, {})
-                logs.append({"ticker": ticker, "year": year, "sheet": "DATA", "column": k, "source": info.get("source", ""), "value": info.get("value"), "status": "OK" if info.get("value") is not None else ("MISSING_OR_NO_PERMISSION" if raw_data.get("status") != "OK" else "MISSING"), "note": "", "endpoint": "API /full-financial-reports"})
+        for future in concurrent.futures.as_completed(futures):
+            ticker = futures[future]
+            completed_count += 1
+            status_text.text(f"Đang xử lý {ticker} ({completed_count}/{len(tickers)})...")
             
-            # Log DATA_DA sheet
-            for k, f in [("Lợi nhuận sau thuế", "net_profit_after_tax"), ("Dòng tiền HĐKD", "operating_cash_flow"), ("Khoản phải thu ngắn hạn năm t", "short_term_receivables"), ("PPE (Nguyên giá TSCĐ)", "ppe_gross"), ("Doanh thu năm t", "revenue"), ("Doanh thu năm t-1", "revenue_prev"), ("ROA", "roa"), ("Tổng tài sản đầu kỳ", "total_assets_prev")]:
-                val_key = f.replace("_prev", "") if "_prev" in f else f
-                src_dict = unified_dict["years"].get(year - 1, {}) if "_prev" in f else yd
-                info = src_dict.get(val_key, {})
-                logs.append({"ticker": ticker, "year": year, "sheet": "DATA_DA", "column": k, "source": info.get("source", ""), "value": info.get("value"), "status": "OK" if info.get("value") is not None else ("MISSING_OR_NO_PERMISSION" if raw_data.get("status") != "OK" else "MISSING"), "note": "", "endpoint": "API /full-financial-reports"})
+            try:
+                _, raw_data, unified_dict = future.result()
+                
+                if raw_data.get("status") == "MISSING_OR_NO_PERMISSION":
+                    st.warning(f"Mã {ticker} không lấy được dữ liệu tài chính.")
                     
-        progress_bar.progress((i + 1) / len(tickers))
+                unified_data_list.append(unified_dict)
+                
+                for year in range(start_year, end_year + 1):
+                    yd = unified_dict["years"].get(year, {})
+                    for k, f in [("Tổng tài sản đầu kỳ", "total_assets_prev"), ("Tổng tài sản năm t", "total_assets"), ("Nợ phải trả năm t", "liabilities"), ("Các khoản phải thu ngắn hạn", "short_term_receivables"), ("Hàng tồn kho", "inventory"), ("Doanh thu thuần", "revenue"), ("Lợi nhuận sau thuế", "net_profit_after_tax"), ("Dòng tiền từ hoạt động kinh doanh", "operating_cash_flow")]:
+                        val_key = "total_assets" if f == "total_assets_prev" else f
+                        src_dict = unified_dict["years"].get(year - 1, {}) if "_prev" in f else yd
+                        info = src_dict.get(val_key, {})
+                        logs.append({"ticker": ticker, "year": year, "sheet": "DATA", "column": k, "source": info.get("source", ""), "value": info.get("value"), "status": "OK" if info.get("value") is not None else ("MISSING_OR_NO_PERMISSION" if raw_data.get("status") != "OK" else "MISSING"), "note": "", "endpoint": "API /full-financial-reports"})
+                    
+                    for k, f in [("Lợi nhuận sau thuế", "net_profit_after_tax"), ("Dòng tiền HĐKD", "operating_cash_flow"), ("Khoản phải thu ngắn hạn năm t", "short_term_receivables"), ("PPE (Nguyên giá TSCĐ)", "ppe_gross"), ("Doanh thu năm t", "revenue"), ("Doanh thu năm t-1", "revenue_prev"), ("ROA", "roa"), ("Tổng tài sản đầu kỳ", "total_assets_prev")]:
+                        val_key = f.replace("_prev", "") if "_prev" in f else f
+                        src_dict = unified_dict["years"].get(year - 1, {}) if "_prev" in f else yd
+                        info = src_dict.get(val_key, {})
+                        logs.append({"ticker": ticker, "year": year, "sheet": "DATA_DA", "column": k, "source": info.get("source", ""), "value": info.get("value"), "status": "OK" if info.get("value") is not None else ("MISSING_OR_NO_PERMISSION" if raw_data.get("status") != "OK" else "MISSING"), "note": "", "endpoint": "API /full-financial-reports"})
+                        
+            except Exception as e:
+                st.error(f"Lỗi xử lý mã {ticker}: {e}")
+                
+            progress_bar.progress(completed_count / len(tickers))
         
     status_text.text("Crawl hoàn tất!")
     st.session_state.unified_data_list = unified_data_list
