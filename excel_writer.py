@@ -158,6 +158,7 @@ class ExcelWriter:
                             "Tổng tài sản đầu kì (Tổng tài sản t-1)": years_dict_prev.get("total_assets", {}),
                             "Tổng tài sản đầu kỳ (Tổng tài sản t-1)": years_dict_prev.get("total_assets", {}),
                             "Tổng tài sản năm t": years_dict.get("total_assets", {}),
+                            "Tổng tài sản": years_dict.get("total_assets", {}),
                             "Nợ phải trả năm t": years_dict.get("liabilities", {}),
                             "Tổng nợ phải trả": years_dict.get("liabilities", {}),
                             "Dòng tiền từ hoạt động kinh doanh": years_dict.get("operating_cash_flow", {}),

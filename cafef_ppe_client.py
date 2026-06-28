@@ -13,10 +13,19 @@ def clean_number(text: str) -> Optional[float]:
         negative = True
         s = s[1:-1]
         
-    s = re.sub(r'[^\d.-]', '', s)
+    # Remove all non-digits, commas, dots, and minus
+    cleaned = re.sub(r'[^\d,.\-]', '', s)
+    if not cleaned or cleaned == '-' or cleaned == '.': return None
+    
+    if "," in cleaned and "." in cleaned:
+        cleaned = cleaned.replace(",", "")
+    elif cleaned.count(",") > 0:
+        cleaned = cleaned.replace(",", "")
+    elif cleaned.count(".") > 1 or (cleaned.count(".") == 1 and len(cleaned.rsplit(".", 1)[1]) == 3):
+        cleaned = cleaned.replace(".", "")
+        
     try:
-        if not s or s == '-' or s == '.': return None
-        num = float(s)
+        num = float(cleaned)
         return -abs(num) if negative else num
     except ValueError:
         return None
@@ -45,18 +54,28 @@ class CafeFPPEClient:
                 return {"status": "MISSING", "data": {}}
                 
             soup = BeautifulSoup(html, 'html.parser')
-            table = soup.find('table', id='tableContent') or soup.find('table')
+            table = soup.find('table', id='tableContent')
             if not table:
+                return {"status": "MISSING", "data": {}}
+                
+            tbl_grid = soup.find('table', id='tblGridData')
+            if not tbl_grid:
                 return {"status": "MISSING", "data": {}}
                 
             rows = table.find_all('tr')
             if not rows:
                 return {"status": "MISSING", "data": {}}
                 
-            # Parse Header for years
+            # Parse Header for years from tblGridData
             years = []
-            headers = rows[0].find_all(['th', 'td'])
-            for th in headers:
+            grid_rows = tbl_grid.find_all('tr')
+            if not grid_rows:
+                return {"status": "MISSING", "data": {}}
+                
+            headers = grid_rows[0].find_all(['th', 'td'])
+            
+            # Note: the first column in headers usually contains 'Trước/Sau' navigation
+            for th in headers[1:]:
                 text = th.get_text(strip=True)
                 year_match = re.search(r'\b(20\d{2})\b', text)
                 if year_match:
