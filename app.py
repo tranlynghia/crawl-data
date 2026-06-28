@@ -152,7 +152,7 @@ if btn_crawl:
             source_name = "FireAnt API"
             
             if raw_data.get("status") == "OK":
-                ppe_res = ppe_client.get_ppe(ticker, end_year)
+                ppe_res = ppe_client.get_ppe(ticker, start_year, end_year)
         else:
             ticker_htmls = []
             for f in uploaded_htmls:

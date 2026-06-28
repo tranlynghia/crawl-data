@@ -38,12 +38,8 @@ class CafeFPPEClient:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         
-    def get_ppe(self, ticker: str, end_year: int) -> Dict[str, Any]:
-        """
-        Lấy Nguyên giá TSCĐ hữu hình (PPE) từ Cân đối kế toán CafeF.
-        Trả về dict: { "status": "OK" / "MISSING" / "ERROR", "data": { year_int: ppe_value_in_millions } }
-        """
-        url = self.URL_TEMPLATE.format(ticker=ticker.lower(), year=end_year)
+    def _fetch_page(self, ticker: str, year: int) -> Dict[str, Any]:
+        url = self.URL_TEMPLATE.format(ticker=ticker.lower(), year=year)
         try:
             res = requests.get(url, headers=self.headers, timeout=10)
             if res.status_code != 200:
@@ -66,15 +62,12 @@ class CafeFPPEClient:
             if not rows:
                 return {"status": "MISSING", "data": {}}
                 
-            # Parse Header for years from tblGridData
             years = []
             grid_rows = tbl_grid.find_all('tr')
             if not grid_rows:
                 return {"status": "MISSING", "data": {}}
                 
             headers = grid_rows[0].find_all(['th', 'td'])
-            
-            # Note: the first column in headers usually contains 'Trước/Sau' navigation
             for th in headers[1:]:
                 text = th.get_text(strip=True)
                 year_match = re.search(r'\b(20\d{2})\b', text)
@@ -87,7 +80,6 @@ class CafeFPPEClient:
             if not valid_years:
                 return {"status": "MISSING", "data": {}}
                 
-            # Find PPE row
             ppe_data = {}
             found_tscd = False
             for tr in rows[1:]:
@@ -95,31 +87,54 @@ class CafeFPPEClient:
                 if not tds: continue
                 
                 name = tds[0].get_text(strip=True).lower()
-                
                 if "tài sản cố định hữu hình" in name:
                     found_tscd = True
                     
                 if found_tscd and "nguyên giá" in name:
-                    # Extract values
-                    # CafeF uses 'number' or 'number-item' class
                     number_tds = [td for td in tds if 'number' in td.get('class', []) or 'number-item' in td.get('class', [])]
-                    
                     if not number_tds:
-                        # Fallback
                         number_tds = [td for td in tds[1:] if not td.find(class_=re.compile('echarts|chart|growth', re.I))]
                         
                     for i, td in enumerate(number_tds):
                         if i < len(valid_years):
                             val = clean_number(td.get_text(strip=True))
                             if val is not None:
-                                # Normalize from VND to Million VND
                                 ppe_data[valid_years[i]] = val / 1_000_000
-                    break # Stop after finding PPE
+                    break
                     
             if ppe_data:
                 return {"status": "OK", "data": ppe_data}
             return {"status": "MISSING", "data": {}}
-            
         except Exception as e:
             print(f"CafeF PPE Error for {ticker}: {e}")
             return {"status": "ERROR", "data": {}}
+
+    def get_ppe(self, ticker: str, start_year: int, end_year: int) -> Dict[str, Any]:
+        """
+        Lấy Nguyên giá TSCĐ hữu hình (PPE) từ Cân đối kế toán CafeF.
+        Lặp qua nhiều trang nếu cần để lấy đủ từ start_year đến end_year.
+        """
+        all_data = {}
+        current_year = end_year
+        
+        # Max loop to avoid infinite loop
+        for _ in range(5):
+            res = self._fetch_page(ticker, current_year)
+            if res["status"] != "OK" or not res["data"]:
+                break
+                
+            page_data = res["data"]
+            all_data.update(page_data)
+            
+            min_year_fetched = min(page_data.keys())
+            if min_year_fetched <= start_year:
+                break
+            
+            # Step back
+            current_year = min_year_fetched - 1
+            if current_year < start_year:
+                break
+                
+        if all_data:
+            return {"status": "OK", "data": all_data}
+        return {"status": "MISSING", "data": {}}
