@@ -185,6 +185,7 @@ class ExcelWriter:
                             "Khoản phải thu ngắn hạn năm t-1": years_dict_prev.get("short_term_receivables", {}),
                             "Khoản phải thu ngắn hạn năm t−1": years_dict_prev.get("short_term_receivables", {}), # alternative dash
                             "PPE (Nguyên giá TSCĐ)": years_dict.get("ppe_gross", {}),
+                            "Nguyên giá tài sản cố định": years_dict.get("ppe_gross", {}),
                             "Nguyên giá tài sản cố định (PPE)": years_dict.get("ppe_gross", {}),
                             "Nguyên giá Tài sản cố định hữu hình": years_dict.get("ppe_gross", {}),
                             "ROA": years_dict.get("roa", {}),
