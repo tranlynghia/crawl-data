@@ -7,16 +7,16 @@ pip install -r ownership_cli/requirements.txt
 python ownership_cli/ownership_101x6.py
 ```
 
-Đầu vào phải tự cung cấp tại máy chạy: `danh_muc_pdf_101x6.csv` và thư mục `pdf_101x6`. Các cache trong `ownership_extract_101x6` là tùy chọn, **không được tải lên GitHub**. Nếu cache lớp chữ thiếu, script đọc lại PDF bằng PyMuPDF. Nếu chưa có `ratio_candidates.csv`, script vẫn xuất đủ dòng theo manifest nhưng tỷ lệ thiếu sẽ để `Không có` đến khi có bằng chứng và kiểm định. Kết quả mặc định là `SO_HUU_NHA_NUOC_101_MA_2020_2025.xlsx`.
+Đầu vào phải tự cung cấp tại máy chạy: `danh_muc_pdf_101x6.csv` và thư mục `pdf_101x6`. Các cache trong `ownership_extract_101x6` là tùy chọn, **không được tải lên GitHub**. Nếu cache lớp chữ thiếu, script đọc lại PDF bằng PyMuPDF. Kết quả mặc định là `SO_HUU_NHA_NUOC_101_MA_2020_2025.xlsx`.
 
-Để OCR lấy mẫu các báo cáo chưa tìm thấy trang cổ đông và kiểm định ứng viên mới bằng Motapis:
+Để quét tất cả trang PDF dạng scan (kể cả khi báo cáo đã có một trang cổ đông dạng văn bản):
 
 ```powershell
-$env:MOTAPIS_API_KEY = '<khóa của bạn>'
-python ownership_cli/ownership_101x6.py --ocr-missing --audit
-Remove-Item Env:MOTAPIS_API_KEY
+python ownership_cli/ownership_101x6.py --ocr-missing
 ```
 
-Có thể chạy riêng `--ocr-missing` hoặc `--audit`. Để OCR, cài Tesseract cùng bộ ngôn ngữ `vie` và `eng`; script dùng `ownership_cli/tessdata` nếu có, nếu không dùng cấu hình Tesseract hệ thống. Mặc định OCR tối đa 6 trang scan mỗi PDF ở 160 DPI; thay bằng `--max-pages` và `--dpi` nếu cần. Cache OCR và kiểm định giúp chạy lại không lặp công việc đã lưu. Khóa API chỉ được đọc từ biến môi trường, không lưu trong mã nguồn.
+Để OCR, cài Tesseract cùng bộ ngôn ngữ `vie` và `eng`; script dùng `ownership_cli/tessdata` nếu có, nếu không dùng cấu hình Tesseract hệ thống. Mặc định OCR mọi trang scan ở 160 DPI; dùng `--max-pages N` để giới hạn số trang mới mỗi PDF trong một lượt và `--dpi` để đổi độ phân giải. Cache OCR giúp tiếp tục lần sau mà không bỏ qua các trang chưa đọc. Chạy toàn bộ OCR có thể tốn nhiều thời gian và dung lượng.
 
-Quy tắc: chỉ xét tỷ lệ có ngày dữ liệu trong **15/12–31/12** của năm báo cáo; không lấy riêng số liệu năm 2026, không suy đoán tư cách Nhà nước của cổ đông tổ chức, không biến thiếu dữ liệu thành 0%. `Không có` trong Excel nghĩa là chưa tìm được tỷ lệ đủ điều kiện, không chứng minh doanh nghiệp không có vốn Nhà nước. OCR lấy mẫu không tương đương đọc hết mọi trang scan; tỷ lệ do API kiểm định vẫn cần đối chiếu thủ công trên trang PDF được liên kết.
+`--audit` cũ tạm khóa vì chỉ kiểm định một ứng viên rồi bỏ sót ứng viên khác; lệnh này báo lỗi thay vì tốn phí API và tạo kết luận thiếu.
+
+`Kiem_tra` có một dòng mỗi mã-năm; `Ung_vien` giữ các dòng/trang cổ đông khác cùng cột, giá trị gốc, ngày và nguồn để đối chiếu. Điểm ưu tiên chỉ sắp thứ tự, không loại trang. Cột tỷ lệ Nhà nước chỉ điền khi bảng ghi rõ tổng sở hữu Nhà nước, đúng cột tỷ lệ sở hữu cổ phần/vốn và ngày dữ liệu **31/12** của năm mục tiêu; nếu hai nguồn cùng ngày mâu thuẫn thì để trống và báo cần kiểm tra. Ngày khác vẫn ở `Ung_vien`. Không suy đoán tư cách Nhà nước của cổ đông tổ chức, không cộng phần vốn HĐQT đại diện, không biến thiếu dữ liệu thành 0%. Bảng có thể ghi rõ 0%, nhưng ô trống không chứng minh 0%. Tỷ lệ do máy đọc vẫn nên đối chiếu trực tiếp trên PDF.

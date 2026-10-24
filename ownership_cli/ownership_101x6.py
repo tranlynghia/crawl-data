@@ -28,11 +28,14 @@ AUDIT_PROMPT = """Bạn kiểm định tỷ lệ sở hữu Nhà nước trong m
 Chỉ dùng nội dung trang được đưa vào. Đọc đúng dòng cổ đông Nhà nước và đúng cột tỷ lệ sở hữu cổ phần/vốn, không lấy tỷ lệ số lượng cổ đông, ngưỡng cổ đông lớn (>5%), tỷ lệ tổ chức hay ngày giao dịch.
 Không mặc định cổ đông tổ chức/Tổng công ty là Nhà nước. Chỉ tính phần được nêu rõ là Nhà nước; không tự cộng nhiều tổ chức.
 Không lấy tỷ lệ phần vốn do một thành viên HĐQT đại diện làm tổng tỷ lệ Nhà nước của doanh nghiệp.
-Ngày dữ liệu phải gắn với bảng/dòng sở hữu và thuộc 15/12–31/12 của năm báo cáo. Không dùng ngày ở footer hoặc năm trên bìa.
+Ngày dữ liệu phải gắn với bảng/dòng sở hữu và đúng 31/12 của năm báo cáo. Không dùng ngày ở footer hoặc năm trên bìa.
 Nếu con số đầu vào sai nhưng bảng ghi rõ con số đúng, trả CORRECT. Nếu đầu vào đúng, trả VALID. Nếu không thể xác định chắc chắn, trả UNCLEAR.
 Chỉ trả JSON object: decision (VALID|CORRECT|UNCLEAR), percentage (số hoặc null), data_date (YYYY-MM-DD hoặc null), support (trích đoạn rất ngắn từ dòng chứng minh), reason (ngắn)."""
 FALLBACK_TERMS = [
     ("cổ đông nhà nước", 140),
+    ("sở hữu nhà nước", 140),
+    ("vốn nhà nước", 140),
+    ("nhà nước", 105),
     ("state shareholder", 140),
     ("state shareholders", 140),
     ("cơ cấu cổ đông", 125),
@@ -41,6 +44,7 @@ FALLBACK_TERMS = [
     ("cơ cấu sở hữu", 120),
     ("ownership structure", 120),
     ("cơ cấu vốn cổ phần", 115),
+    ("vốn cổ phần", 95),
     ("số lượng cổ đông", 110),
     ("number of shareholders", 110),
     ("danh sách cổ đông lớn", 105),
@@ -61,6 +65,172 @@ def normalize(value: str) -> str:
 
 
 NORMALIZED_TERMS = [(term, normalize(term), weight) for term, weight in FALLBACK_TERMS]
+DATE_PATTERN = re.compile(r"(?<!\d)(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(20\d{2})(?!\d)")
+RATIO_CELL = re.compile(r"^\s*(\d{1,3}(?:[.,]\d{1,4})?)\s*%?\s*$")
+EMPTY_CELL = {"", "-", "–", "—"}
+RATIO_HEADERS = ("ty le", "percentage", "phan tram")
+DATE_CONTEXT = ("tai ngay", "chot ngay", "den ngay", "as of", "as at")
+
+
+def matched_terms(text: str) -> list[str]:
+    normalized = normalize(text)
+    return [term for term, normalized_term, _ in NORMALIZED_TERMS if normalized_term in normalized]
+
+
+def split_cells(line: str) -> list[str]:
+    return [cell.strip() for cell in re.split(r"\s*\|\s*|\t+|\s{2,}", line.strip()) if cell.strip()]
+
+
+def parse_percentage(cell: str) -> float | None:
+    match = RATIO_CELL.fullmatch(cell)
+    if not match:
+        return None
+    value = float(match.group(1).replace(",", "."))
+    return value if 0 <= value <= 100 else None
+
+
+def classify_holder(label: str) -> str:
+    normalized = normalize(re.sub(r"^[•●\-–—]?\s*(?:\d+|[IVX]+)[.)]?\s+", "", label, flags=re.IGNORECASE))
+    if any(term in normalized for term in ("dai dien von", "dai dien phan von", "von dai dien", "representative capital")):
+        return "Vốn đại diện HĐQT"
+    if normalized in {"nha nuoc", "co dong nha nuoc", "so huu nha nuoc", "von nha nuoc", "state", "state shareholders", "state ownership"}:
+        return "Tổng sở hữu Nhà nước"
+    if "nha nuoc" in normalized or "state shareholder" in normalized:
+        return "Cổ đông Nhà nước riêng lẻ"
+    if "nuoc ngoai" in normalized or "foreign" in normalized:
+        return "Cổ đông nước ngoài"
+    if "trong nuoc" in normalized or "domestic" in normalized:
+        return "Cổ đông trong nước"
+    if "to chuc" in normalized or "institutional" in normalized:
+        return "Cổ đông tổ chức"
+    return "Cổ đông/chỉ tiêu chưa xác minh tư cách Nhà nước"
+
+
+def table_date(lines: list[str], header_index: int, previous_page: str = "") -> tuple[str | None, str]:
+    nearby = lines[max(0, header_index - 18):header_index + 1]
+    dated = []
+    for line in nearby:
+        if not any(marker in normalize(line) for marker in DATE_CONTEXT):
+            continue
+        for match in DATE_PATTERN.finditer(line):
+            try:
+                dated.append(date(int(match.group(3)), int(match.group(2)), int(match.group(1))).isoformat())
+            except ValueError:
+                continue
+    if not dated and header_index < 12 and previous_page:
+        return table_date(previous_page.splitlines()[-12:], 12)
+    unique = set(dated)
+    if len(unique) == 1:
+        return dated[-1], "Ngày gắn với bảng" if not previous_page else "Ngày trên trang trước"
+    return None, "Nhiều ngày gần bảng" if unique else "Chưa thấy ngày gắn với bảng"
+
+
+def extract_page_candidates(ticker: str, year: int, pages: list[dict[str, Any]], source: str | None = None) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    previous_by_file: dict[str, str] = {}
+    for page in sorted(pages, key=lambda item: (str(item.get("pdf_file")), int(item.get("page_number") or 0))):
+        text = str(page.get("text") or "")
+        file_name = str(page.get("pdf_file") or "")
+        lines = text.splitlines()
+        keywords = matched_terms(text)
+        if not keywords:
+            previous_by_file[file_name] = text
+            continue
+        score, _ = page_score(text, year)
+        page_data = {
+            "ticker": ticker, "year": year, "pdf_file": file_name,
+            "page_number": int(page.get("page_number") or 0), "source": source,
+            "keywords": "; ".join(keywords), "score": score,
+            "method": "OCR" if page.get("ocr") else "Lớp chữ PDF",
+        }
+        page_candidates = []
+        headers = [(index, line, split_cells(line)) for index, line in enumerate(lines)
+                   if len(split_cells(line)) >= 2 and any(
+                       normalize(cell).startswith(("ty le", "percentage", "phan tram"))
+                       for cell in split_cells(line))]
+        for header_index, header_line, header_cells in headers:
+            column_indices = [index for index, cell in enumerate(header_cells)
+                              if normalize(cell).startswith(("ty le", "percentage", "phan tram"))]
+            if not column_indices:
+                continue
+            column_index = column_indices[0]
+            data_date, date_note = table_date(lines, header_index)
+            if data_date is None and date_note == "Chưa thấy ngày gắn với bảng" and header_index < 12:
+                previous = previous_by_file.get(file_name, "")
+                if previous:
+                    data_date, date_note = table_date(previous.splitlines()[-12:], 12)
+                    if data_date:
+                        date_note = "Ngày trên trang trước"
+            next_header = next((index for index, _, _ in headers if index > header_index), len(lines))
+            for row_line in lines[header_index + 1:min(next_header, header_index + 65)]:
+                cells = split_cells(row_line)
+                if len(cells) < 2 or not re.search(r"[A-Za-zÀ-ỹ]", cells[0]):
+                    if len(cells) < 3 or not re.fullmatch(r"(?:\d+|[IVX]+)[.)]?", cells[0], flags=re.IGNORECASE):
+                        continue
+                if any(marker in normalize(row_line) for marker in RATIO_HEADERS):
+                    continue
+                label_index = 1 if re.fullmatch(r"(?:\d+|[IVX]+)[.)]?", cells[0], flags=re.IGNORECASE) else 0
+                if not re.search(r"[A-Za-zÀ-ỹ]", cells[label_index]):
+                    continue
+                percent_cells = [cell for cell in cells[1:] if "%" in cell and parse_percentage(cell) is not None]
+                if len(percent_cells) == 1:
+                    ratio_cell = percent_cells[0]
+                elif len(percent_cells) > 1:
+                    for raw_value in percent_cells:
+                        page_candidates.append({**page_data, "holder": cells[label_index], "column": None,
+                                                "raw_value": raw_value, "percentage": parse_percentage(raw_value),
+                                                "data_date": data_date, "date_note": "Nhiều cột tỷ lệ; cần xác định đúng cột",
+                                                "classification": classify_holder(cells[label_index]),
+                                                "ownership_column": False,
+                                                "evidence": f"{header_line.strip()}\n{row_line.strip()}"})
+                    continue
+                elif len(cells) == len(header_cells) and column_index < len(cells):
+                    ratio_cell = cells[column_index]
+                elif column_index == len(header_cells) - 1 and len(cells) >= 3:
+                    ratio_cell = cells[-1]
+                else:
+                    ratio_cell = ""
+                if not ratio_cell:
+                    continue
+                header_position = header_line.find(header_cells[column_index])
+                value_position = row_line.rfind(ratio_cell)
+                if header_position >= 0 and value_position >= 0 and abs(header_position - value_position) > 45:
+                    continue
+                percentage = parse_percentage(ratio_cell)
+                if percentage is None and ratio_cell not in EMPTY_CELL:
+                    continue
+                label = cells[label_index]
+                classification = classify_holder(label)
+                header_context = normalize(" ".join(lines[max(0, header_index - 2):header_index + 1]))
+                ratio_column = normalize(header_cells[column_index])
+                ownership_column = (
+                    any(marker in ratio_column for marker in ("so huu", "von dieu le", "shareholding", "ownership"))
+                    or any(marker in header_context for marker in ("so co phan", "so luong co phan", "so co phieu", "number of shares", "share capital"))
+                ) and not any(marker in ratio_column for marker in ("so luong co dong", "number of shareholders"))
+                page_candidates.append({**page_data, "holder": label, "column": header_cells[column_index],
+                                        "raw_value": ratio_cell, "percentage": percentage,
+                                        "data_date": data_date, "date_note": date_note,
+                                        "classification": classification, "ownership_column": ownership_column,
+                                        "evidence": f"{header_line.strip()}\n{row_line.strip()}"})
+        if not page_candidates:
+            for line in lines:
+                match = re.search(r"(?<!\d)(\d{1,3}(?:[.,]\d{1,4})?)\s*%", line)
+                if not match or not any(term in normalize(line) for term in ("co dong", "nha nuoc", "so huu", "shareholder")):
+                    continue
+                holder = line[:match.start()].strip()
+                page_candidates.append({**page_data, "holder": holder, "column": None,
+                                        "raw_value": match.group(), "percentage": parse_percentage(match.group()),
+                                        "data_date": None, "date_note": "Chưa xác định bảng/ngày/cột",
+                                        "classification": classify_holder(holder), "ownership_column": False,
+                                        "evidence": line.strip()})
+            if not page_candidates:
+                page_candidates.append({**page_data, "holder": None, "column": None, "raw_value": None,
+                                        "percentage": None, "data_date": None, "date_note": "Chưa xác định bảng/ngày",
+                                        "classification": "Trang cổ đông cần kiểm tra", "ownership_column": False,
+                                        "evidence": excerpt(text, keywords[0], 1800)})
+        candidates.extend(page_candidates)
+        previous_by_file[file_name] = text
+    return candidates
 
 
 def validated_ratio(review: dict[str, Any], row: dict[str, Any]) -> tuple[float | None, str]:
@@ -73,7 +243,7 @@ def validated_ratio(review: dict[str, Any], row: dict[str, Any]) -> tuple[float 
         data_date = date.fromisoformat(str(parsed["data_date"]))
     except (KeyError, TypeError, ValueError):
         return None, "API thiếu tỷ lệ hoặc ngày hợp lệ"
-    if not (0 < percentage <= 100 and data_date.year == int(row["Năm báo cáo"]) and data_date.month == 12 and data_date.day >= 15):
+    if not (0 <= percentage <= 100 and data_date == date(int(row["Năm báo cáo"]), 12, 31)):
         return None, "Tỷ lệ/ngày ngoài phạm vi"
     reason = str(parsed.get("reason") or "")
     for raw_date in re.findall(r"(?:bảng ngày|danh sách chốt ngày)\s*(\d{1,2}/\d{1,2}/20\d{2})", reason, flags=re.IGNORECASE):
@@ -224,18 +394,16 @@ def ocr_missing_pages(manifest: pd.DataFrame, cache_root: Path, ocr_cache_root: 
             continue
         cache_path = cache_root / f"{ticker}_{year}.json.gz"
         pages = load_pages(cache_path, pdf_paths)
-        if find_fallback_page(pages, year):
-            continue
         output_cache = ocr_cache_root / f"{ticker}_{year}.json.gz"
-        if output_cache.exists():
-            continue
+        existing_pages = load_ocr(output_cache).get("pages", [])
+        existing_keys = {(page.get("pdf_file"), page.get("page_number")) for page in existing_pages}
         by_file: dict[str, list[dict[str, Any]]] = {}
         for page in pages:
-            if page.get("needs_ocr"):
+            if page.get("needs_ocr") and (page.get("pdf_file"), page.get("page_number")) not in existing_keys:
                 by_file.setdefault(str(page["pdf_file"]), []).append(page)
         selected = []
         for file_pages in by_file.values():
-            if len(file_pages) <= max_pages:
+            if max_pages == 0 or len(file_pages) <= max_pages:
                 selected.extend(file_pages)
                 continue
             indexes = {round(index * (len(file_pages) - 1) / max(max_pages - 1, 1)) for index in range(max_pages)}
@@ -250,9 +418,10 @@ def ocr_missing_pages(manifest: pd.DataFrame, cache_root: Path, ocr_cache_root: 
                 pixmap = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), colorspace=fitz.csRGB, alpha=False)
                 image = Image.open(BytesIO(pixmap.tobytes("png")))
                 page_text = pytesseract.image_to_string(image, lang="vie+eng", config="--psm 6").strip()
-            ocr_pages.append({**selected_page, "text": page_text, "visible_chars": len(re.sub(r"\s", "", page_text)), "needs_ocr": False})
-        candidates = extract_ocr_candidates(ticker, year, ocr_pages)
-        payload = {"ticker": ticker, "year": year, "ocr_pages": len(ocr_pages), "pages": ocr_pages, "candidates": candidates, "errors": []}
+            ocr_pages.append({**selected_page, "text": page_text, "visible_chars": len(re.sub(r"\s", "", page_text)), "needs_ocr": False, "ocr": True})
+        all_ocr_pages = existing_pages + ocr_pages
+        candidates = extract_ocr_candidates(ticker, year, all_ocr_pages)
+        payload = {"ticker": ticker, "year": year, "ocr_pages": len(all_ocr_pages), "pages": all_ocr_pages, "candidates": candidates, "errors": []}
         with gzip.open(output_cache, "wt", encoding="utf-8", compresslevel=4) as handle:
             json.dump(payload, handle, ensure_ascii=False)
         reports += 1
@@ -336,10 +505,8 @@ def eligible_ocr_candidate(candidate: dict[str, Any], report_year: int) -> bool:
         return False
     return (
         bool(candidate.get("explicit_state_term"))
-        and 0 < ratio <= 100
-        and data_date.year == report_year
-        and data_date.month == 12
-        and data_date.day >= 15
+        and 0 <= ratio <= 100
+        and data_date == date(report_year, 12, 31)
     )
 
 
@@ -658,6 +825,132 @@ def build_review(manifest_path: Path, result_path: Path, cache_root: Path, ocr_c
     return statistics
 
 
+def choose_state_total(candidates: list[dict[str, Any]], year: int) -> tuple[dict[str, Any] | None, str]:
+    target_date = f"{year}-12-31"
+    qualified = [candidate for candidate in candidates
+                 if candidate.get("classification") == "Tổng sở hữu Nhà nước"
+                 and candidate.get("percentage") is not None
+                 and candidate.get("data_date") == target_date
+                 and candidate.get("column") and candidate.get("ownership_column") and candidate.get("evidence")]
+    values = {round(float(candidate["percentage"]), 6) for candidate in qualified}
+    if len(values) > 1:
+        return None, "Mâu thuẫn tỷ lệ cùng ngày; cần kiểm tra"
+    if qualified:
+        return max(qualified, key=lambda candidate: (candidate["score"], -candidate["page_number"])), "Đã xác minh từ bảng; cần đối chiếu PDF"
+    if any(candidate.get("classification") == "Tổng sở hữu Nhà nước" for candidate in candidates):
+        return None, "Có tỷ lệ/bảng Nhà nước nhưng thiếu ngày hoặc cột hợp lệ"
+    if any(candidate.get("holder") for candidate in candidates):
+        return None, "Có bảng cổ đông; chưa xác minh tỷ lệ Nhà nước"
+    return None, "Chưa tìm được bảng cổ đông"
+
+
+def build_candidate_review(manifest_path: Path, result_path: Path, cache_root: Path, ocr_cache_root: Path,
+                           pdf_root: Path, output_path: Path) -> dict[str, int]:
+    manifest = pd.read_csv(manifest_path, encoding="utf-8-sig") if manifest_path.suffix.lower() == ".csv" else pd.read_excel(manifest_path)
+    if not result_path.exists():
+        details = pd.DataFrame()
+    elif result_path.suffix.lower() == ".csv":
+        details = pd.read_csv(result_path, encoding="utf-8-sig")
+    else:
+        details = pd.read_excel(result_path, sheet_name="Chi_tiet")
+    detail_by_key: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for row in details.to_dict("records"):
+        detail_by_key.setdefault((str(row["Mã CK"]).strip().upper(), int(row["Năm báo cáo"])), []).append(row)
+    workbook = Workbook()
+    summary = workbook.active
+    summary.title = "Kiem_tra"
+    summary.append(["Mã CK", "Năm mục tiêu", "Tỷ lệ Nhà nước (%)", "Trạng thái", "Tên cổ đông/chỉ tiêu ứng viên",
+                    "Tỷ lệ ứng viên (%)", "Ngày số liệu", "Trang PDF", "Từ khóa", "Bằng chứng", "Nguồn"])
+    inventory = workbook.create_sheet("Ung_vien")
+    inventory.append(["Mã CK", "Năm mục tiêu", "File PDF", "Trang PDF", "Nhóm phân loại", "Tên cổ đông/chỉ tiêu",
+                      "Tên cột", "Giá trị gốc", "Tỷ lệ ứng viên (%)", "Ngày số liệu", "Ghi chú ngày",
+                      "Từ khóa", "Bằng chứng", "Nguồn", "Phương pháp", "Điểm ưu tiên"])
+    notes = workbook.create_sheet("Ghi_chu")
+    notes.append(["Mục", "Giải thích"])
+    notes.append(["Ngày mục tiêu", "Chỉ chốt tỷ lệ từ bảng ghi rõ ngày 31/12 của năm; ngày khác giữ tại Ung_vien."])
+    notes.append(["Ứng viên", "Tỷ lệ cổ đông khác, tổ chức, cá nhân, vốn HĐQT và dữ liệu cũ không tự chuyển thành tỷ lệ Nhà nước."])
+    notes.append(["Ô trống", "Không có bằng chứng không tương đương 0%; dấu gạch ngang giữ nguyên tại Giá trị gốc."])
+    notes.append(["OCR", "Chỉ các trang đã OCR mới được tìm; dùng --ocr-missing với --max-pages 0 để quét toàn bộ trang scan."])
+    statistics = {"Tổng dòng mã-năm": 0, "Có tỷ lệ Nhà nước từ bảng": 0, "Còn cần kiểm tra": 0,
+                  "Thiếu PDF": 0, "Số ứng viên/trang": 0}
+    for item in manifest.sort_values(["Mã CK", "Năm"]).to_dict("records"):
+        ticker, year = str(item["Mã CK"]).strip().upper(), int(item["Năm"])
+        pdf_paths = sorted((pdf_root / ticker).glob(f"{ticker}_{year}*.pdf"))
+        available_pdf_names = {path.name for path in pdf_paths}
+        source = item.get("URL")
+        if pd.isna(source):
+            source = None
+        pages = load_pages(cache_root / f"{ticker}_{year}.json.gz", pdf_paths)
+        ocr_pages = [{**page, "ocr": True} for page in load_ocr(ocr_cache_root / f"{ticker}_{year}.json.gz").get("pages", [])]
+        ocr_keys = {(page.get("pdf_file"), page.get("page_number")) for page in ocr_pages}
+        searchable_pages = [page for page in pages if (page.get("pdf_file"), page.get("page_number")) not in ocr_keys] + ocr_pages
+        candidates = extract_page_candidates(ticker, year, searchable_pages, source)
+        for detail in detail_by_key.get((ticker, year), []):
+            if not pd.notna(detail.get("Tỷ lệ sở hữu Nhà nước (%)")):
+                continue
+            candidates.append({"ticker": ticker, "year": year, "pdf_file": detail.get("File PDF"),
+                               "page_number": int(detail["Trang PDF"]) if pd.notna(detail.get("Trang PDF")) else None,
+                               "source": source, "keywords": detail.get("Từ khóa tìm thấy"), "score": -1,
+                               "method": "Ứng viên từ kết quả cũ", "holder": "Tỷ lệ cũ chưa đối chiếu lại",
+                               "column": None, "raw_value": detail.get("Tỷ lệ sở hữu Nhà nước (%)"),
+                               "percentage": float(detail["Tỷ lệ sở hữu Nhà nước (%)"]), "data_date": None,
+                               "date_note": "Cần đọc lại ngày trên bảng", "classification": "Dữ liệu cũ cần kiểm tra",
+                               "evidence": str(detail.get("Đoạn/bảng bằng chứng") or "")[:1800]})
+        candidates.sort(key=lambda candidate: (-int(candidate.get("score") or 0),
+                                                str(candidate.get("pdf_file") or ""), int(candidate.get("page_number") or 0)))
+        selected, status = choose_state_total(candidates, year)
+        if not pdf_paths:
+            status = "Thiếu PDF; chưa đủ thông tin"
+            statistics["Thiếu PDF"] += 1
+        featured = selected or next((candidate for candidate in candidates if candidate.get("holder")), None) or (candidates[0] if candidates else {})
+        summary.append([ticker, year, selected["percentage"] if selected else None, status,
+                        featured.get("holder"), featured.get("percentage"), featured.get("data_date"),
+                        featured.get("page_number"), featured.get("keywords"), featured.get("evidence"), source])
+        if selected:
+            statistics["Có tỷ lệ Nhà nước từ bảng"] += 1
+        else:
+            statistics["Còn cần kiểm tra"] += 1
+        statistics["Tổng dòng mã-năm"] += 1
+        statistics["Số ứng viên/trang"] += len(candidates)
+        for candidate in candidates:
+            inventory.append([ticker, year, candidate.get("pdf_file"), candidate.get("page_number"),
+                              candidate.get("classification"), candidate.get("holder"), candidate.get("column"),
+                              candidate.get("raw_value"), candidate.get("percentage"), candidate.get("data_date"),
+                              candidate.get("date_note"), candidate.get("keywords"), candidate.get("evidence"),
+                              source, candidate.get("method"), candidate.get("score")])
+            if candidate.get("pdf_file") and candidate.get("page_number"):
+                pdf_path = pdf_root / ticker / str(candidate["pdf_file"])
+                if pdf_path.name in available_pdf_names:
+                    inventory.cell(inventory.max_row, 4).hyperlink = f"{pdf_path.resolve().as_uri()}#page={candidate['page_number']}"
+                    inventory.cell(inventory.max_row, 4).style = "Hyperlink"
+        for sheet, row_number, candidate, page_column in ((summary, summary.max_row, featured, 8),):
+            file_name, page_number = candidate.get("pdf_file"), candidate.get("page_number")
+            if file_name and page_number:
+                pdf_path = (pdf_root / ticker / str(file_name)).resolve()
+                if pdf_path.exists():
+                    sheet.cell(row_number, page_column).hyperlink = f"{pdf_path.as_uri()}#page={page_number}"
+                    sheet.cell(row_number, page_column).style = "Hyperlink"
+    for sheet in (summary, inventory, notes):
+        for cell in sheet[1]:
+            cell.fill = PatternFill("solid", fgColor="1F4E78")
+            cell.font = Font(color="FFFFFF", bold=True)
+            cell.alignment = Alignment(wrap_text=True)
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for row in sheet.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+        for column in sheet.columns:
+            letter = column[0].column_letter
+            sheet.column_dimensions[letter].width = 72 if letter in {"J", "M"} else 25
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        workbook.save(output_path)
+    except PermissionError as exc:
+        raise RuntimeError(f"Không thể ghi {output_path}; đóng file Excel hoặc chọn --output khác") from exc
+    return statistics
+
+
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -670,17 +963,19 @@ def main() -> None:
     parser.add_argument("--audit-cache-root", type=Path, default=Path("ownership_extract_101x6/audit_text_ratios"))
     parser.add_argument("--fallback-audit-root", type=Path, default=Path("ownership_extract_101x6/audit_fallback_ratios"))
     parser.add_argument("--ocr-audit-root", type=Path, default=Path("ownership_extract_101x6/audit_ocr_ratios"))
-    parser.add_argument("--ocr-missing", action="store_true", help="OCR lấy mẫu báo cáo chưa tìm thấy trang cổ đông")
-    parser.add_argument("--audit", action="store_true", help="Kiểm định ứng viên mới bằng Motapis; cần MOTAPIS_API_KEY")
-    parser.add_argument("--max-pages", type=int, default=6)
+    parser.add_argument("--ocr-missing", action="store_true", help="OCR mọi trang scan chưa được OCR, kể cả khi đã thấy trang cổ đông")
+    parser.add_argument("--audit", action="store_true", help="Chế độ kiểm định cũ (tạm khóa để tránh chọn một ứng viên rồi bỏ phần còn lại)")
+    parser.add_argument("--max-pages", type=int, default=0, help="Số trang scan tối đa mỗi PDF mỗi lượt; 0 = toàn bộ")
     parser.add_argument("--dpi", type=int, default=160)
     parser.add_argument("--tessdata", type=Path, default=Path("ownership_cli/tessdata"))
     parser.add_argument("--audit-model", default="gpt-5.6-sol")
     parser.add_argument("--output", type=Path, default=Path("SO_HUU_NHA_NUOC_101_MA_2020_2025.xlsx"))
     args = parser.parse_args()
-    if args.max_pages <= 0 or args.dpi <= 0:
-        parser.error("--max-pages và --dpi phải dương")
-    if args.ocr_missing or args.audit:
+    if args.max_pages < 0 or args.dpi <= 0:
+        parser.error("--max-pages phải không âm và --dpi phải dương")
+    if args.audit:
+        parser.error("--audit cũ chỉ kiểm định một ứng viên và chưa tương thích với bảng Ung_vien; chưa gọi API để tránh kết quả thiếu")
+    if args.ocr_missing:
         if args.manifest.suffix.lower() == ".csv":
             manifest = pd.read_csv(args.manifest, encoding="utf-8-sig")
         else:
@@ -688,16 +983,7 @@ def main() -> None:
         if args.ocr_missing:
             ocr_statistics = ocr_missing_pages(manifest, args.cache_root, args.ocr_cache_root, args.pdf_root, args.tessdata, args.max_pages, args.dpi)
             print(json.dumps(ocr_statistics, ensure_ascii=False), flush=True)
-        if args.audit:
-            if not args.results.exists():
-                details = pd.DataFrame()
-            elif args.results.suffix.lower() == ".csv":
-                details = pd.read_csv(args.results, encoding="utf-8-sig")
-            else:
-                details = pd.read_excel(args.results, sheet_name="Chi_tiet")
-            audit_statistics = audit_candidates(manifest, details, args.cache_root, args.ocr_cache_root, args.audit_cache_root, args.fallback_audit_root, args.ocr_audit_root, args.pdf_root, args.audit_model)
-            print(json.dumps(audit_statistics, ensure_ascii=False), flush=True)
-    statistics = build_review(args.manifest, args.results, args.cache_root, args.ocr_cache_root, args.audit_cache_root, args.fallback_audit_root, args.ocr_audit_root, args.pdf_root, args.output)
+    statistics = build_candidate_review(args.manifest, args.results, args.cache_root, args.ocr_cache_root, args.pdf_root, args.output)
     print(json.dumps({**statistics, "File kết quả": str(args.output)}, ensure_ascii=False))
 
 
