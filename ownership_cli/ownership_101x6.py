@@ -954,37 +954,51 @@ def build_candidate_review(manifest_path: Path, result_path: Path, cache_root: P
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    parser = argparse.ArgumentParser(description="Xử lý PDF sở hữu Nhà nước và tạo bảng 606 mã-năm")
+    parser = argparse.ArgumentParser(description="Xử lý PDF sở hữu Nhà nước và tạo bảng 606 mã-năm (Luồng thống nhất)")
+    parser.add_argument("--legacy", action="store_true", help="Chạy luồng cũ tạo file 3 sheet Ung_vien")
+    parser.add_argument("--sample", type=int, default=None, help="Chạy thử mẫu N file")
+    parser.add_argument("--workers", type=int, default=2, help="Số worker song song")
+    parser.add_argument("--local", action="store_true", help="Bật Local Ollama model")
+    parser.add_argument("--retry-unverified", action="store_true", help="Chạy lại các mục chưa xác minh")
+    parser.add_argument("--export-only", action="store_true", help="Chỉ xuất lại file Excel từ checkpoint")
     parser.add_argument("--manifest", type=Path, default=Path("danh_muc_pdf_101x6.csv"))
-    parser.add_argument("--results", type=Path, default=Path("ownership_extract_101x6/ratio_candidates.csv"))
-    parser.add_argument("--cache-root", type=Path, default=Path("ownership_extract_101x6/page_cache"))
-    parser.add_argument("--pdf-root", type=Path, default=Path("pdf_101x6"))
-    parser.add_argument("--ocr-cache-root", type=Path, default=Path("ownership_extract_101x6/ocr_cache_v2_160_6"))
-    parser.add_argument("--audit-cache-root", type=Path, default=Path("ownership_extract_101x6/audit_text_ratios"))
-    parser.add_argument("--fallback-audit-root", type=Path, default=Path("ownership_extract_101x6/audit_fallback_ratios"))
-    parser.add_argument("--ocr-audit-root", type=Path, default=Path("ownership_extract_101x6/audit_ocr_ratios"))
-    parser.add_argument("--ocr-missing", action="store_true", help="OCR mọi trang scan chưa được OCR, kể cả khi đã thấy trang cổ đông")
-    parser.add_argument("--audit", action="store_true", help="Chế độ kiểm định cũ (tạm khóa để tránh chọn một ứng viên rồi bỏ phần còn lại)")
-    parser.add_argument("--max-pages", type=int, default=0, help="Số trang scan tối đa mỗi PDF mỗi lượt; 0 = toàn bộ")
-    parser.add_argument("--dpi", type=int, default=160)
-    parser.add_argument("--tessdata", type=Path, default=Path("ownership_cli/tessdata"))
-    parser.add_argument("--audit-model", default="gpt-5.6-sol")
-    parser.add_argument("--output", type=Path, default=Path("SO_HUU_NHA_NUOC_101_MA_2020_2025.xlsx"))
+    parser.add_argument("--output", type=Path, default=Path("Ket_Qua_So_Huu_Nha_Nuoc.xlsx"))
     args = parser.parse_args()
-    if args.max_pages < 0 or args.dpi <= 0:
-        parser.error("--max-pages phải không âm và --dpi phải dương")
-    if args.audit:
-        parser.error("--audit cũ chỉ kiểm định một ứng viên và chưa tương thích với bảng Ung_vien; chưa gọi API để tránh kết quả thiếu")
-    if args.ocr_missing:
-        if args.manifest.suffix.lower() == ".csv":
-            manifest = pd.read_csv(args.manifest, encoding="utf-8-sig")
-        else:
-            manifest = pd.read_excel(args.manifest)
-        if args.ocr_missing:
-            ocr_statistics = ocr_missing_pages(manifest, args.cache_root, args.ocr_cache_root, args.pdf_root, args.tessdata, args.max_pages, args.dpi)
-            print(json.dumps(ocr_statistics, ensure_ascii=False), flush=True)
-    statistics = build_candidate_review(args.manifest, args.results, args.cache_root, args.ocr_cache_root, args.pdf_root, args.output)
-    print(json.dumps({**statistics, "File kết quả": str(args.output)}, ensure_ascii=False))
+
+    if not args.legacy:
+        from ownership_core.pipeline import OwnershipPipeline
+        from ownership_core.inventory import load_canonical_manifest
+        from ownership_core.exporter import export_single_sheet_excel
+
+        pipeline = OwnershipPipeline(
+            manifest_path=args.manifest,
+            output_excel=args.output,
+            num_workers=args.workers
+        )
+        if args.export_only:
+            inv = load_canonical_manifest(args.manifest)
+            export_single_sheet_excel(inv, pipeline.results_map, args.output)
+            print(f"Đã xuất xong file Excel chuẩn: {args.output}")
+            return
+
+        print("[LUỒNG CHÍNH THỐNG NHẤT] Đang chạy OwnershipPipeline v2.0...")
+        stats = pipeline.run(
+            sample_count=args.sample,
+            use_local_model=args.local,
+            retry_unverified=args.retry_unverified
+        )
+        print(json.dumps(stats, ensure_ascii=False, indent=2))
+        return
+
+    # Fallback luồng legacy cũ nếu có cờ --legacy
+    manifest_p = args.manifest
+    results_p = Path("ownership_extract_101x6/ratio_candidates.csv")
+    cache_root = Path("ownership_extract_101x6/page_cache")
+    ocr_cache_root = Path("ownership_extract_101x6/ocr_cache_v2_160_6")
+    pdf_root = Path("pdf_101x6")
+    out_p = Path("SO_HUU_NHA_NUOC_101_MA_2020_2025.xlsx")
+    statistics = build_candidate_review(manifest_p, results_p, cache_root, ocr_cache_root, pdf_root, out_p)
+    print(json.dumps({**statistics, "File kết quả": str(out_p)}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

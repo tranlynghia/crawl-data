@@ -19,5 +19,7 @@ ownership_trial_work/
 *.jsonl
 *.log
 listapi
+.cache_ownership/
+*_backup*
 .env
 .env.*
