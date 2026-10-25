@@ -17,5 +17,7 @@ ownership_trial_work/
 *.rar
 *.sqlite3
 *.jsonl
+*.log
+listapi
 .env
 .env.*
