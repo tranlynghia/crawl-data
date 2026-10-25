@@ -95,6 +95,7 @@ def parse_vietnamese_number(raw_val: Any) -> Tuple[Optional[float], Optional[int
     Chuẩn hóa chuỗi số tiếng Việt/Anh thành (ratio_float, count_int).
     Xử lý: '51,08%', '51.08', '6.562.361', '6,562,361', '-', '–', None.
     TUYỆT ĐỐI không biến None, ô trống hoặc gạch ngang thành 0.
+    Trả về (None, None) an toàn nếu là văn bản chữ hoặc không phải số.
     """
     if raw_val is None:
         return None, None
@@ -103,8 +104,14 @@ def parse_vietnamese_number(raw_val: Any) -> Tuple[Optional[float], Optional[int
     if s in {"", "-", "–", "—", "N/A", "null", "None"}:
         return None, None
 
-    # Bỏ ký tự %
+    # Nếu chuỗi chứa chữ cái tiếng Việt hoặc tiếng Anh -> chắc chắn là văn bản chữ, không phải số
+    if re.search(r"[A-Za-z\u00C0-\u024F\u1EA0-\u1EF9]", s):
+        return None, None
+
+    # Bỏ ký tự %, dấu ngoặc đơn âm
     s_clean = s.replace("%", "").strip()
+    if s_clean.startswith("(") and s_clean.endswith(")"):
+        s_clean = "-" + s_clean[1:-1].strip()
 
     # Nhận diện định dạng chấm/phẩy:
     # Trường hợp 1: Có cả dấu chấm và phẩy (ví dụ: '1.234.567,89' hoặc '1,234,567.89')
@@ -127,8 +134,14 @@ def parse_vietnamese_number(raw_val: Any) -> Tuple[Optional[float], Optional[int
     elif "." in s_clean:
         # Chỉ có dấu chấm:
         parts = s_clean.split(".")
-        if len(parts) == 2 and 1 <= len(parts[1]) <= 4 and float(s_clean) <= 100.0:
-            s_norm = s_clean
+        if len(parts) == 2 and 1 <= len(parts[1]) <= 4:
+            try:
+                if float(s_clean) <= 100.0:
+                    s_norm = s_clean
+                else:
+                    s_norm = s_clean.replace(".", "")
+            except ValueError:
+                return None, None
         elif len(parts) >= 2 and all(len(p) == 3 for p in parts[1:]):
             # Ngăn cách hàng nghìn (ví dụ: '6.562.361')
             s_norm = s_clean.replace(".", "")
@@ -146,7 +159,7 @@ def parse_vietnamese_number(raw_val: Any) -> Tuple[Optional[float], Optional[int
             return round(val_float, 4), None
         else:
             return None, int(val_float)
-    except ValueError:
+    except (ValueError, TypeError):
         return None, None
 
 
